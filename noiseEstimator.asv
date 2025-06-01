@@ -1,0 +1,466 @@
+function [DarkCurrent,DarkVariance,ShotCoefficient,MultiplicativeCoefficient,NEParameters]=noiseEstimator(I,NEParametersIn, IParameters, flag_figure)
+% Main function for noise estimation of image I by determining the coefficients for
+% the noise model:
+% noise variance = DarkVariance + ShotCoefficient*(I-DarkCurrent) +
+% MultiplicativeCoefficient*(I-DarkCurrent)^2.
+% See article for details.
+
+% INPUT
+% I (input): n x m x s matrix, stack of s images of n x m size. 
+% NEParametersIn (optional input): structure containing fields that regulates
+% aspects of noise estimation process, used to customize the processing.
+% IParameters (optional input): parameters describing the image, output of
+% syntheticImageGeneration if the image is synthetic, used for validation. 
+
+% OUTPUT (if the parameter SeparateSlices is false they are scalars, otherwise they are s x 1 vectors)
+% DarkCurrent: baseline signal
+% DarkVariance: variance of constant white noise
+% ShotCoefficient: coefficient of first order tern
+% MultiplicativeCoefficient: coeficient of second order term
+% NEParameters: the final parameters used for noise estimation
+
+% FIELDS OF NEParametersIn 
+
+% HighpassWavelength: high pass threshold (wavelength, px) to isolate high frequency noise;
+% PatchSize: side size (px) of the overlapped 2D square patches (blocks) for block processing;
+% BinSize: number of element contained in each bin durion binning operations over the blocks.
+% The binning is performed according to increasing block average intensity.
+% SeparateSlices
+
+% Value and noise variance of baseline signal (dark_current, dark_variance) estimation parameters
+% VartotCutoffPrc: cutoff percentile for blocks, based on average block intensity,
+%   the blocks with higher intensity values are trimmed.
+% VartotTrimPrc: cutoff percentile to trim off the binned blocks, based on block total variance,
+%   a two-side trim of the blocks of each bin is performed.
+% VartotLowPrc: Cutoff percentile for blocks to select the blocks with lower total variance
+%   as representative of no signal area.
+% DarkCurrentTrimPrc: percentile for two-side trimming of the low-total-variance blocks,
+%   according to block average intensity. Used in the trimmed mean to compute the final
+% DarkCurrent and DarkVariance.
+
+% Parameters for estimation of signal-dependent noise
+% ICutoffPrc: cutoff percentile for blocks, based on average block intensity, the blocks with higher intensity values are trimmed off;
+% VarTrimPrc: the same as VartotTrimPrc but applied to trim the block estimated noise
+%   variance.
+% SeparateSlices: flag to perform the noise estimation per slice. Used for
+% validation purpose.
+% ExtraFigureSliceNumber: show extra graphics for this slice;
+
+
+if nargin<2
+    NEParametersIn=[];
+end
+if nargin<3
+    IParameters=[];
+end
+if nargin<4
+    flag_figure=true;
+end
+
+% determine if the image is synthetic
+flag_synthetic=false;
+if not(isempty(IParameters))
+    if isfield(IParameters,'Synthetic')
+        if IParameters.Synthetic
+            flag_synthetic=true;
+        end
+    end
+end
+
+% Default parameters values
+NEParameters.HighpassWavelength=1.2;
+NEParameters.PatchSize=10;
+NEParameters.BinSize=100;
+if flag_synthetic
+    NEParameters.SeparateSlices=true;
+else
+    NEParameters.SeparateSlices=false;
+end
+NEParameters.VartotCutoffPrc=50;
+NEParameters.VartotTrimPrc=20;
+NEParameters.VartotLowPrc=2;
+NEParameters.DarkCurrentTrimPrc=NEParameters.VartotTrimPrc;
+NEParameters.ICutoffPrc=99.5;
+NEParameters.VarTrimPrc=NEParameters.VartotTrimPrc;
+NEParameters.SliceNumber=0;
+
+% overrides the defaults with the custom values
+if not(isempty(NEParametersIn))
+    fl=fields(NEParametersIn);
+    for i=1:numel(fl)
+        NEParameters.(fl{i})=NEParametersIn.(fl{i});
+    end
+end
+
+if flag_synthetic
+    if not(isempty(IParameters))
+        NEParameters.SyntheticParameters=IParameters;
+    end
+end
+
+
+I=double(I);
+
+if isfield(NEParameters,'SyntheticParameters')
+    if isfield(NEParameters.SyntheticParameters,'NoiseEstimateBypass')
+        if strcmp(NEParameters.SyntheticParameters.NoiseEstimateBypass,'on')
+            DarkCurrent=NEParameters.SyntheticParameters.DarkCurrent;
+            DarkVariance=NEParameters.SyntheticParameters.WhiteNoiseCoefficient;
+            ShotCoefficient=NEParameters.SyntheticParameters.ShotNoiseCoefficient;
+            MultiplicativeCoefficient=NEParameters.SyntheticParameters.MultNoiseCoefficient;
+            return
+        end
+    end
+end
+
+if NEParameters.SeparateSlices
+    % estimate noise per slice
+    for i=1:size(I,3)
+        if and(i==NEParameters.SliceNumber,flag_figure)
+            [dark_current2,dark_variance2,shot_noise_coeff2,multiplicative_noise_coeff2]=noise_estimator_aux(I(:,:,i),NEParameters,['Slice ' num2str(i)]);
+        else
+            [dark_current2,dark_variance2,shot_noise_coeff2,multiplicative_noise_coeff2]=noise_estimator_aux(I(:,:,i),NEParameters,[]);
+        end
+        DarkCurrent(i,1)=dark_current2;
+        DarkVariance(i,1)=dark_variance2;
+        ShotCoefficient(i,1)=shot_noise_coeff2;
+        MultiplicativeCoefficient(i,1)=multiplicative_noise_coeff2;
+    end
+
+    % produce graphics
+    if flag_figure
+        xraw=double((round(NEParameters.SyntheticParameters.DarkCurrent):1:prctile(I,NEParameters.ICutoffPrc,"all"))');
+        x=xraw-NEParameters.SyntheticParameters.DarkCurrent;
+        y_th=NEParameters.SyntheticParameters.WhiteNoiseCoefficient + NEParameters.SyntheticParameters.ShotNoiseCoefficient*(x-0) + NEParameters.SyntheticParameters.MultNoiseCoefficient*(x-0).^2;
+        y1000_th=NEParameters.SyntheticParameters.WhiteNoiseCoefficient + NEParameters.SyntheticParameters.ShotNoiseCoefficient*1000 + NEParameters.SyntheticParameters.MultNoiseCoefficient*1000^2;
+
+        hf=figure('Name','Noise Model Fitting Accuracy');
+        hold on
+        for i=1:numel(DarkCurrent)
+            y1000w(i)=DarkVariance(i);
+            y1000s(i)=ShotCoefficient(i)*1000;
+            y1000m(i)=MultiplicativeCoefficient(i)*1000^2;
+            y1000(i)= y1000w(i)+y1000s(i)+y1000m(i);
+            y(:,i)=DarkVariance(i) + ShotCoefficient(i)*(xraw-DarkCurrent(i)) + MultiplicativeCoefficient(i)*(xraw-DarkCurrent(i)).^2;
+            hp1=plot(xraw,y(:,i),'LineWidth',1,'Color',[1 0.75 0.5]);
+        end
+        hp2=plot(xraw,y_th,'LineWidth',2,'Color',[0.7 0 0.7]);
+        hp3=plot(xraw,mean(y,2),'LineWidth',2,'Color',[1 0.5 0]);
+        y_std=std(y,0,2);
+        hp4=plot(xraw,mean(y,2)+y_std,'LineWidth',1,'Color',[1 0.5 0],'LineStyle','--');
+        plot(xraw,mean(y,2)-y_std,'LineWidth',1,'Color',[1 0.5 0],'LineStyle','--');
+        hold off
+        y_rel_acc_avg=mean(sqrt(mean((y-y_th).^2,2))./y_th)*100;
+        n_std_avg=mean(std(sqrt(y),0,2));
+        n_bias=mean(sqrt(y),2)-sqrt(y_th);
+        n_bias_avg=mean(n_bias);
+        n_rel_bias_avg=mean(n_bias./sqrt(y_th))*100;
+        n_acc=sqrt(mean((sqrt(y)-sqrt(y_th)).^2,2));
+        n_acc_avg=mean(n_acc);
+        n_rel_acc_avg=mean(n_acc./sqrt(y_th))*100;
+        legend([hp2 hp1 hp3 hp4],{'Theoretical Noise Model'; 'Fitted Noise Models'; 'Mean Fitted Model'; '+- 1 SD Confidence Interval'},'Location','northwest')
+
+        text(0.05,0.96,['Noise Variance Average Relative Accuracy: ' num2str(y_rel_acc_avg) ' %'],'Units','normalized');
+        text(0.05,0.92,['Noise SD Average Bias: ' num2str(n_bias_avg) ' +- ' num2str(n_std_avg)],'Units','normalized');
+        text(0.05,0.88,['Noise SD Average Relative Bias: ' num2str(n_rel_bias_avg) ' %'],'Units','normalized');
+        text(0.05,0.84,['Noise SD Average Accuracy: ' num2str(n_acc_avg)],'Units','normalized');
+        text(0.05,0.80,['Noise SD Average Relative Accuracy: ' num2str(n_rel_acc_avg) ' %'],'Units','normalized');
+        text(0.05,0.75,['Dark Current: ' num2str(mean(DarkCurrent)) ' +- ' num2str(std(DarkCurrent))],'Units','normalized');
+        text(0.05,0.7,['Noise SNR at 1000: ' num2str(mean(1000./sqrt(y1000))) ' +- ' num2str(std(1000./sqrt(y1000)))],'Units','normalized');
+        text(0.05,0.66,['Noise SD at 1000: ' num2str(mean(sqrt(y1000))) ' +- ' num2str(std(sqrt(y1000)))],'Units','normalized');
+        text(0.05,0.61,['White Noise SNR at 1000: ' num2str(mean(1000./sqrt(y1000w))) ' +- ' num2str(std(1000./sqrt(y1000w)))],'Units','normalized');
+        text(0.05,0.57,['White Noise SD at 1000: ' num2str(mean(sqrt(y1000w))) ' +- ' num2str(std(sqrt(y1000w)))],'Units','normalized');
+        text(0.05,0.52,['Shot Noise SNR at 1000: ' num2str(mean(1000./sqrt(y1000s))) ' +- ' num2str(std(1000./sqrt(y1000s)))],'Units','normalized');
+        text(0.05,0.48,['Shot Noise SD at 1000: ' num2str(mean(sqrt(y1000s))) ' +- ' num2str(std(sqrt(y1000s)))],'Units','normalized');
+        text(0.05,0.43,['Mult Noise SNR at 1000: ' num2str(mean(1000./sqrt(y1000m))) ' +- ' num2str(std(1000./sqrt(y1000m)))],'Units','normalized');
+        text(0.05,0.39,['Mult Noise SD at 1000: ' num2str(mean(sqrt(y1000m))) ' +- ' num2str(std(sqrt(y1000m)))],'Units','normalized');
+
+        title('Noise Model Estimated Variance')
+        ylabel('Noise Variance')
+        xlabel('Image Intensity')
+
+
+        hf=figure('Name','Noise Model (SD)');
+        y_SD=sqrt(y);
+        hold on
+        for i=1:numel(DarkCurrent)
+            hp1=plot(xraw,y_SD(:,i),'LineWidth',1,'Color',[1 0.75 0.5]);
+        end
+        hp2=plot(xraw,sqrt(y_th),'LineWidth',2,'Color',[0.7 0 0.7]);
+        hp3=plot(xraw,mean(y_SD,2),'LineWidth',2,'Color',[1 0.5 0]);
+        y_std=std(y_SD,0,2);
+        hp4=plot(xraw,mean(y_SD,2)+y_std,'LineWidth',1,'Color',[1 0.5 0],'LineStyle','--');
+        plot(xraw,mean(y_SD,2)-y_std,'LineWidth',1,'Color',[1 0.5 0],'LineStyle','--');
+        hold off
+        legend([hp2 hp1 hp3 hp4],{'Theoretical Noise Model'; 'Fitted Noise Models'; 'Mean Fitted Model'; '+- 1 SD Confidence Interval'},'Location','northwest')
+        title('Noise Model Estimated SD')
+        ylabel('Noise SD')
+        xlabel('Image Intensity')
+    end
+else
+    % estimate noise on the whole stack
+    if flag_figure
+        [DarkCurrent,DarkVariance,ShotCoefficient,MultiplicativeCoefficient]=noise_estimator_aux(I,NEParameters,'Image Stack');
+    else
+        [DarkCurrent,DarkVariance,ShotCoefficient,MultiplicativeCoefficient]=noise_estimator_aux(I,NEParameters,[]);
+    end
+end
+
+%---------------------------------------------------------------------------------
+function [dark_current,dark_variance,shot_noise_coeff,multiplicative_noise_coeff]=noise_estimator_aux(I,NEParameters,image_name)
+% Estimate noise on image I
+% I (input): n x m x s matrix, stack of s images of n x m size. 
+% NEParametersIn (optional input): structure containing fields that regulates
+% aspects of noise estimation process, used to customize the processing.
+% image_name (optional input): if not empty produces graphics titled with
+% that name
+
+% OUTPUT
+% dark_current: baseline signal
+% dark_variance: variance of constant white noise
+% shot_noise_coeff: coefficient of first order tern
+% multiplicative_noise_coeff: coeficient of second order term
+
+
+PatchSize=NEParameters.PatchSize;
+BinSize=NEParameters.BinSize;
+Icutoff=NEParameters.ICutoffPrc;
+VartotCutoffPrc=NEParameters.VartotCutoffPrc;
+VartotLowPrc=NEParameters.VartotLowPrc;
+VartotTrimPrc=NEParameters.VartotTrimPrc;
+VarTrimPrc=NEParameters.VarTrimPrc;
+DarkCurrentTrimPrc=NEParameters.DarkCurrentTrimPrc;
+
+% low pass filter
+n=10;
+beta=5;
+[Ilow,ker]=lowPass(I,NEParameters.HighpassWavelength,n,beta,'symmetric');
+
+% high pass image
+Ihigh=I-Ilow;
+
+% computation of the correcting factor to estimate the noise variance from
+% the high pass image variance
+ker1=zeros(size(ker));
+ind=ceil(size(ker)/2);
+ker1(ind(1),ind(2))=1;
+cost=sum((ker1-ker).^2,'all');
+
+% block images
+Ic=im2colOverlap(I,PatchSize); % original image
+Ihighc=im2colOverlap(Ihigh,PatchSize); % high pass image
+
+
+Iavg=mean(Ic,1); % average intensity in original image blocks
+Vartot=sum((Ic-Iavg).^2,1)/(PatchSize^2-1); % intensity variance in original image blocks
+Var=sum((Ihighc-mean(Ihighc,1)).^2,1)/(PatchSize^2-1)/cost; % intensity variance in high pass image corrected to estimate the noise variance
+
+
+clear I Ihigh
+
+% BASELINE SIGNAL (DARK CURRENT) AND ITS NOISE VARIANCE
+% ESTIMATION--------------------------------------------------------------
+Iavg=Iavg(:);
+Var=Var(:);
+Vartot=Vartot(:);
+
+% trimming of the block average intensity and variance by progressive
+% binning
+[Iavg_trimmed,Vartot_trimmed,Iavg_dis,Vartot_dis]=trimData(Iavg,Vartot,BinSize,VartotTrimPrc,'both');
+
+% threshold to isolate the block with lowest variance
+vartot_thres=prctile(Vartot_trimmed,VartotLowPrc);
+
+% threshold to exclude the block with highest mean intensity
+iavg_thres=prctile(Iavg_trimmed,VartotCutoffPrc);
+ymax=prctile(Vartot_trimmed(:),VartotCutoffPrc);
+
+% isolation of the blocks representing baseline areas
+mask=and(Vartot_trimmed<=vartot_thres,Iavg_trimmed<=iavg_thres);
+
+% estimation of baseline signal
+dark_current=trimmean(Iavg_trimmed(mask),DarkCurrentTrimPrc);
+dark_current_std=std(Iavg_trimmed(mask));
+
+% estimation of baseline noise variance in correspondence of the baseline
+% signal
+mask2=and(Iavg_trimmed>(dark_current-dark_current_std),Iavg_trimmed<(dark_current+dark_current_std));
+dark_variance0=trimmean(Vartot_trimmed(mask2),DarkCurrentTrimPrc);
+
+% figures generation
+if not(isempty(image_name))
+    hf=figure('Name',[image_name ': Image Variance on Patches and Dark Current Estimate']);
+    ax=axes;
+    plot(Iavg_dis,Vartot_dis,'LineStyle','none',Marker='.',Color=[0.75 0.75 0.75]);
+    hold on
+    plot(Iavg_trimmed,Vartot_trimmed,'LineStyle','none',Marker='.',Color=[0.5 0.5 0.5]);
+    plot(Iavg_trimmed(mask),Vartot_trimmed(mask),'LineStyle','none',Marker='.',Color=[0 0 0]);
+    
+    xlim([prctile(Iavg_trimmed,0) iavg_thres]);
+    ylim([0 ymax]);
+    plot(xlim,[vartot_thres vartot_thres],'Color','b');
+    
+    plot([dark_current dark_current],ylim,'Color',[0.8 0 0],'LineWidth',2);
+    plot(dark_current,dark_variance0,'Linestyle','none','Marker','o','Color',[0.8 0 0]);
+    text(dark_current,ymax/2,num2str(dark_current));
+    
+    hold off
+    legend({['Discarded Local Image Variance (' num2str(VartotTrimPrc) ' %)'],'Trimmed Local Image Variance','Local Image Variance on Background Tiles',['Variance Threshold for Background Tiles (' num2str(VartotLowPrc) ' %)'],'Dark Current Estimate'},'Location','northwest');
+    xlabel('Local Image Intensity')
+    ylabel('Local Image Variance')
+    ax.Title.String='Dark Current Estimation';
+end
+%---------------------------------------------------------------------------------
+
+% limit to exclude block with highest intensity
+Ilim=prctile(Iavg(:),Icutoff);
+
+% limit to exclude block with highest noise variance
+Varlim=prctile(Var(:),99.99);
+
+% exclusion of the blocks with very high intensity or noise variance
+maskI=Iavg<Ilim;
+maskVar=Var(:)<Varlim;
+mask=and(maskI,maskVar);
+Iavg0=Iavg;
+Var0=Var;
+Iavg=Iavg(mask);
+Var=Var(mask);
+
+% blocks are ordered by increasing average intesity
+[Iavg,m]=sort(Iavg);
+Var=Var(m);
+
+% blocks are trimmed according to the binning procedure and bin statistics
+% are computed
+[Iavg_trimmed,Var_trimmed,Iavg_dis,Var_dis,IavgBin,VarBin,IavgBinSD,~,~,VarBinSE]=trimData(Iavg,Var,BinSize,VarTrimPrc,'both'); % redundant
+
+
+mask=isnan(IavgBin);
+IavgBin(mask)=[];
+IavgBinSD(mask)=[];
+VarBin(mask)=[];
+VarBinSE(mask)=[];
+
+
+Iavg2b=IavgBin-dark_current;
+signal_scale=sqrt(mean(Iavg2b.^2));
+Iavg2b=Iavg2b/signal_scale;
+
+% if true, interpolation of dark variance use the value dark_variance0 previously found in
+% correspondence of the dark_current, otherwise the dark variance is estimated as a
+% free parameter in the interpolation
+use_darkvariance=true;
+
+Iavg2b2=Iavg2b.^2;
+if use_darkvariance
+    A=[Iavg2b Iavg2b2];
+    w=VarBinSE./IavgBinSD;
+    p_tot=(A./w)\((VarBin-dark_variance0)./w);
+    
+    if and(p_tot(2)<=0,p_tot(1)>0)
+        A=[Iavg2b];
+        p_tot(1)=(A./w)\((VarBin-dark_variance0)./w);
+        p_tot(2)=0;
+    elseif and(p_tot(2)>0,p_tot(1)<=0)
+        A=[Iavg2b2];
+        p_tot(2)=(A./w)\((VarBin-dark_variance0)./w);
+        p_tot(1)=0;
+    end
+
+    x=[0:1:prctile(Iavg0,99.9)]';
+    xb=(x-dark_current)/signal_scale;
+    y=dark_variance0+p_tot(1)*xb+p_tot(2)*xb.^2;
+    dark_variance=dark_variance0;
+    shot_noise_coeff=p_tot(1)/signal_scale;
+    multiplicative_noise_coeff=p_tot(2)/(signal_scale^2);
+
+else
+    A=[ones(size(Iavg2b)) Iavg2b Iavg2b2];
+    w=VarBinSE./IavgBinSD;
+    p_tot=(A./w)\(VarBin./w);
+    if and(p_tot(3)<=0,p_tot(2)>0)
+        A=[ones(size(Iavg2b)) Iavg2b];
+        p_tot(1:2)=(A./w)\(VarBin./w);
+        p_tot(3)=0;
+    elseif and(p_tot(3)<=0,p_tot(2)<=0)
+        A=[ones(size(Iavg2b))];
+        p_tot(1)=(A./w)\(VarBin./w);
+        p_tot(2)=0;
+        p_tot(3)=0;
+    elseif and(p_tot(3)>0,p_tot(2)<=0)
+        A=[ones(size(Iavg2b)) Iavg2b2];
+        p_tot([1 3])=(A./w)\(VarBin./w);
+        p_tot(2)=0;
+    end
+    if and(p_tot(3)<=0,p_tot(2)>0)
+        A=[ones(size(Iavg2b)) Iavg2b];
+        p_tot(1:2)=(A./w)\(VarBin./w);
+        p_tot(3)=0;
+    elseif and(p_tot(3)<=0,p_tot(2)<=0)
+        A=[ones(size(Iavg2b))];
+        p_tot(1)=(A./w)\(VarBin./w);
+        p_tot(2)=0;
+        p_tot(3)=0;
+    elseif and(p_tot(3)>0,p_tot(2)<=0)
+        A=[ones(size(Iavg2b)) Iavg2b2];
+        p_tot([1 3])=(A./w)\(VarBin./w);
+        p_tot(2)=0;
+    end
+    x=[0:1:prctile(Iavg0,99.9)]';
+    xb=(x-dark_current)/signal_scale;
+    y=p_tot(1)+p_tot(2)*xb+p_tot(3)*xb.^2;
+
+    dark_variance=max(p_tot(1),0);
+    shot_noise_coeff=p_tot(2)/signal_scale;
+    multiplicative_noise_coeff=p_tot(3)/(signal_scale^2);
+end
+
+% produce graphics
+if isfield(NEParameters,'SyntheticParameters')
+    y_th=NEParameters.SyntheticParameters.WhiteNoiseCoefficient + NEParameters.SyntheticParameters.ShotNoiseCoefficient*(x-NEParameters.SyntheticParameters.DarkCurrent) + NEParameters.SyntheticParameters.MultNoiseCoefficient*(x-NEParameters.SyntheticParameters.DarkCurrent).^2;
+end
+
+h_dc=[];
+if not(isempty(image_name))
+    hf=figure('Name',[image_name ': Noise Model Fitting']);
+    ax=axes;
+
+    plot(Iavg0,Var0(:),'LineStyle','none','Marker','.','Color',[0.6 0.6 0.6]);
+    hold on
+    plot(Iavg_trimmed,Var_trimmed,'LineStyle','none','Marker','.','Color',[0.3 0.3 0.3]);
+    xlim([prctile(Iavg0,0.01) prctile(Iavg0,99)]);
+    ymax=prctile(Var0(:),99);
+    ylim([0 ymax]);
+    plot(x,y,'LineWidth',2,'Color',[1 0.5 0]);
+
+    plot(IavgBin',VarBin','LineWidth',1,'Color',[1 0 0]);
+    errorbar(IavgBin',VarBin',VarBinSE','LineStyle','none','Color',[1 0 0]);
+
+
+
+    plot(dark_current,dark_variance,'LineStyle','none','Marker','o','MarkerSize',5,'Color',[1 0 1],'MarkerFaceColor',[1 0 1]);
+    if isfield(NEParameters,'SyntheticParameters')
+        plot(x,y_th,'LineWidth',2,'Color',[0.7 0 0.7]);
+    end
+    if not(isempty(h_dc))
+        plot(x_dc,h_dc/max(h_dc)*ymax*0.9,'LineWidth',1,'Color',[0 0 0]);
+        legend('Local Noise Variance','Fitted Noise Variance Model','Mean of Trimmed Binned Variance','SE of Trimmed Binned Variance','Dark Current','Histogram for dark current definition');
+    else
+        if isfield(NEParameters,'SyntheticParameters')
+            legend('Discarded Local Noise Variance','Trimmed Local Noise Variance','Fitted Noise Variance Model','Mean of Trimmed Binned Variance','SE of Trimmed Binned Variance','Dark Current','Theoretical Noise Variance Model','Location','northwest');
+        else
+            legend('Discarded Local Noise Variance','Trimmed Local Noise Variance','Fitted Noise Variance Model','Mean of Trimmed Binned Variance','SE of Trimmed Binned Variance','Dark Current','Location','northwest');
+        end
+    end
+
+    xlabel('Local Image Intensity')
+    ylabel('Local Noise Variance')
+    ax.Title.String='Noise Model Fitting on Local Noise Variance';
+
+end
+
+
+
+
+

@@ -1,0 +1,86 @@
+function [BMask,BDParameters,SNR]=backgroundDetection(Isig,NoiseVariance,Spacing,BDParametersIn)
+
+% Isig: signal image subtracted of the baseline
+% NoiseVariance: variance image of the noise
+% SNRThreshold: threshold for SNR, pixel with SNR inferior to SNRThreshold
+% are potentially classified as background.
+
+% SignalSmoothingRadius: sigma (spatial units) of Gaussian smoothing for the signal and the
+% noise variance
+
+% defaults
+BDParameters.SignalSmoothingRadius=1;
+BDParameters.AreaOpeningThreshold=100;
+BDParameters.MaskSmoothingRadius=0.5;
+BDParameters.Smoothing3D=true;
+BDParameters.LowSignalThreshold=1;
+BDParameters.SNRThreshold=3;
+
+% overrides the defaults with the custom values
+if not(isempty(BDParametersIn))
+    fl=fields(BDParametersIn);
+    for i=1:numel(fl)
+        BDParameters.(fl{i})=BDParametersIn.(fl{i});
+    end
+end
+
+DepthDimension=3; % the third dimension is the slice index
+
+if BDParameters.SignalSmoothingRadius>0
+    % calculate sigma for smoothing in px
+    sigma=BDParameters.SignalSmoothingRadius./Spacing;
+
+    g{1}=fspecial('gaussian', [2*ceil(2*sigma(1))+1 1],sigma(1));
+    g{2}=fspecial('gaussian', [2*ceil(2*sigma(2))+1 1],sigma(2));
+    g{2}=g{2}';
+    g{3}=fspecial('gaussian', [2*ceil(2*sigma(3))+1 1],sigma(3));
+    g{3}=permute(g{3},[2 3 1]);
+
+    for j=1:3
+        if j==DepthDimension
+            if BDParameters.Smoothing3D
+                Isig=imfilter(Isig,g{j},'replicate');
+                NoiseVariance=imfilter(NoiseVariance,g{j},'replicate');
+            end
+        else
+            Isig=imfilter(Isig,g{j},'replicate');
+            NoiseVariance=imfilter(NoiseVariance,g{j},'replicate');
+        end
+    end
+end
+
+SNR=max(Isig,0)./(sqrt(NoiseVariance)+eps);
+maskSNR=SNR<BDParameters.SNRThreshold;
+masklow=Isig<BDParameters.LowSignalThreshold;
+BMask=double(or(maskSNR,masklow));
+
+if BDParameters.MaskSmoothingRadius>0
+    sigma=BDParameters.MaskSmoothingRadius./Spacing;
+    g{1}=fspecial('gaussian', [2*ceil(2*sigma(1))+1 1],sigma(1));
+    g{2}=fspecial('gaussian', [2*ceil(2*sigma(2))+1 1],sigma(2));
+    g{2}=g{2}';
+    g{3}=fspecial('gaussian', [2*ceil(2*sigma(3))+1 1],sigma(3));
+    g{3}=permute(g{3},[2 3 1]);
+    for j=1:3
+        if j==DepthDimension
+            if BDParameters.Smoothing3D
+                BMask=imfilter(BMask,g{j},'replicate');
+            end
+        else
+            BMask=imfilter(BMask,g{j},'replicate');
+        end
+    end
+end
+
+BMask=BMask>0.5;
+
+% perform area opening and closing to cleanup the mask
+if BDParameters.AreaOpeningThreshold>0
+    if Smoothing3D
+        BMask = bwareaopen(BMask, BDParameters.AreaOpeningThreshold, 6);
+        BMask = not(bwareaopen(not(BMask), BDParameters.AreaOpeningThreshold, 6));
+    else
+        BMask = bwareaopen(BMask, AreaOpeningThreshold, 4);
+        BMask = not(bwareaopen(not(BMask), AreaOpeningThreshold, 4));
+    end
+end
